@@ -17,7 +17,9 @@
 |------|------|
 | `main.py` | Tkinter GUI 主程式與 Matplotlib 視覺化 |
 | `audio_processor.py` | 麥克風輸入、訊號產生、FFT 與峰值偵測 |
-| `serial_meter.py` | 與 Arduino + INA219 韌體（`ina219_meter.ino`）的序列埠通訊 |
+| `serial_meter.py` | 與 Arduino + INA219 韌體的序列埠通訊 |
+| `INA219/INA219meter/INA219meter.ino` | Arduino 直流量測韌體（需安裝 Adafruit INA219 函式庫） |
+| `INA219/INA219.ino` | INA219 簡易測試程式 |
 
 ## 安裝
 
