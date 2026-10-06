@@ -146,6 +146,40 @@ CSV_HEADER = [
     "峰值1 (Hz)", "峰值2 (Hz)", "峰值3 (Hz)", "峰值4 (Hz)", "峰值5 (Hz)",
 ]
 
+# ── CSV 匯入：欄位名稱對照 ───────────────────────────────────────────────────
+# NOTE: 舊版程式（交流阻抗時期）的欄位名稱不同，這裡一併收進來，
+#   讓以前存的檔也能直接匯入。比對時會把空白與大小寫正規化掉。
+COLUMN_ALIASES: dict[str, tuple[str, ...]] = {
+    "time":        ("時間", "time"),
+    "target_freq": ("目標頻率 (Hz)", "目標頻率", "目標(Hz)", "目標", "target", "目標頻率(Hz)"),
+    "top_freq":    ("主峰頻率 (Hz)", "主峰頻率", "主峰(Hz)", "主峰", "主峰頻率(Hz)"),
+    "db":          ("dBSPL", "db", "聲壓", "聲壓位準"),
+    # 舊版的 |Z| 與 Irms 是交流量，物理意義和直流 R / Idc 不同，
+    # 但放在同一欄位才能一起畫圖，匯入摘要會提醒使用者
+    "r":           ("電阻 R (Ω)", "電阻 R", "電阻", "R(Ω)", "R",
+                    "實測|Z| (Ω)", "阻抗 |Z| (Ω)", "|Z|(Ω)", "估計|Z| (Ω)"),
+    "vdc":         ("電壓 Vdc (V)", "Vdc (V)", "電壓", "vdc"),
+    # 舊版交流檔的「Idc」其實是分流電阻的直流偏移（沒有物理意義），
+    # 真正有用的是 Irms，所以把 Irms 排在裸 Idc 前面
+    "idc":         ("電流 Idc (mA)", "電流", "校正Irms (mA)", "Irms (mA)",
+                    "Idc (mA)", "idc"),
+    "p":           ("功率 P (mW)", "P (mW)", "功率", "p"),
+    "di":          ("ΔI (mA)", "ΔI", "di"),
+    "dp":          ("ΔP (mW)", "ΔP", "dp"),
+    "iac":         ("漣波 Iac (mA)", "Iac (mA)", "漣波", "iac"),
+    "ripple":      ("漣波比 (%)", "漣波比", "ripple"),
+    "fs":          ("取樣率 (Hz)", "取樣率", "fs"),
+    "off":         ("歸零偏移 (mA)", "歸零偏移", "off"),
+    "n_merge":     ("合併筆數", "筆數", "N"),
+}
+PEAK_ALIASES = tuple(
+    (f"峰值{i} (Hz)", f"峰值{i}(Hz)", f"峰值{i}", f"peak{i}") for i in range(1, 6))
+
+# 匯入時嘗試的編碼順序（Excel 存的中文 CSV 常是 cp950）
+IMPORT_ENCODINGS = ("utf-8-sig", "utf-8", "cp950", "big5", "gbk", "latin-1")
+# 視為空值的字串
+_NULLS = {"", "n/a", "na", "nan", "none", "-", "—", "--"}
+
 # 合併時要取平均的數值欄位
 AVG_KEYS = ("top_freq", "db", "r", "vdc", "idc", "p",
             "di", "dp", "iac", "ripple", "fs", "off")
@@ -177,6 +211,151 @@ def build_freq_list(start: float, end: float, step: float) -> list[float]:
     if freqs and abs(freqs[-1] - end) > 1e-6:
         freqs.append(float(end))
     return freqs
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  CSV 匯入
+# ══════════════════════════════════════════════════════════════════════════
+
+def _norm_header(s: str) -> str:
+    """把欄位名稱正規化：去掉空白（含全形）與大小寫差異，方便比對。"""
+    return "".join(str(s).split()).replace("　", "").lower()
+
+
+def _to_float(s):
+    """把 CSV 欄位轉成 float；空值／N/A 回 None。"""
+    if s is None:
+        return None
+    t = str(s).strip()
+    if t.lower() in _NULLS:
+        return None
+    try:
+        return float(t.replace(",", ""))
+    except ValueError:
+        return None
+
+
+def read_csv_file(path: str) -> tuple[list[dict], dict]:
+    """
+    讀取本程式匯出的 CSV（也相容舊版欄位名稱），轉成內部記錄格式。
+
+    欄位以「名稱」比對而非位置，所以欄位順序不同、缺欄位、多欄位都能處理。
+
+    Args:
+        path: CSV 檔案路徑
+    Returns:
+        (記錄列表, 資訊 dict)
+        資訊 dict 含 encoding / matched（對應到的欄位）/ unmatched（沒認出的標題）
+        / skipped（無法解析的列數）/ derived_target（是否用主峰頻率補目標頻率）
+    """
+    text = None
+    used_enc = None
+    for enc in IMPORT_ENCODINGS:
+        try:
+            with open(path, "r", newline="", encoding=enc) as f:
+                text = f.read()
+            used_enc = enc
+            break
+        except UnicodeDecodeError:
+            continue
+    if text is None:
+        raise ValueError("無法判讀檔案編碼（已試過 UTF-8 / CP950 / Big5）")
+
+    import io
+    reader = csv.reader(io.StringIO(text))
+    try:
+        header = next(reader)
+    except StopIteration:
+        raise ValueError("檔案是空的")
+
+    norm = [_norm_header(h) for h in header]
+
+    # 標題 → 內部欄位
+    # NOTE: 依「別名的先後順序」決定優先權，而不是欄位在檔案中的位置。
+    #   舊版 CSV 同時有「估計|Z|」和「實測|Z|」兩欄，要優先取實測的那一欄。
+    col_of: dict[str, int] = {}
+    for key, names in COLUMN_ALIASES.items():
+        for alias in names:
+            a = _norm_header(alias)
+            idx = next((i for i, h in enumerate(norm) if h == a), None)
+            if idx is not None:
+                col_of[key] = idx
+                break
+    peak_cols: list[int] = []
+    for names in PEAK_ALIASES:
+        wanted = {_norm_header(n) for n in names}
+        peak_cols.append(next((i for i, h in enumerate(norm) if h in wanted), -1))
+
+    if "db" not in col_of and "target_freq" not in col_of and "top_freq" not in col_of:
+        raise ValueError(
+            "認不出任何欄位。請確認這是本程式匯出的 CSV。\n"
+            f"讀到的標題：{', '.join(header[:8])}")
+
+    matched_idx = set(col_of.values()) | {i for i in peak_cols if i >= 0}
+    unmatched = [header[i] for i in range(len(header))
+                 if i not in matched_idx and header[i].strip()]
+
+    # 沒有「目標頻率」欄位時，用主峰頻率當目標，否則掃頻曲線畫不出來
+    derived_target = "target_freq" not in col_of and "top_freq" in col_of
+
+    def cell(parts, key):
+        i = col_of.get(key, -1)
+        return parts[i] if 0 <= i < len(parts) else None
+
+    rows: list[dict] = []
+    skipped = 0
+    for parts in reader:
+        if not any(str(p).strip() for p in parts):
+            continue
+        top = _to_float(cell(parts, "top_freq"))
+        tgt = _to_float(cell(parts, "target_freq"))
+        db = _to_float(cell(parts, "db"))
+        if derived_target:
+            tgt = top
+        if top is None:
+            top = tgt
+        if top is None and db is None:
+            skipped += 1
+            continue
+
+        peaks = []
+        for i in peak_cols:
+            if 0 <= i < len(parts):
+                v = _to_float(parts[i])
+                if v is not None:
+                    peaks.append({"freq": v, "amplitude": None})
+
+        n_merge = _to_float(cell(parts, "n_merge"))
+        t = cell(parts, "time")
+        rows.append({
+            "time": (str(t).strip() if t else ""),
+            "target_freq": tgt,
+            "top_freq": top if top is not None else 0.0,
+            "db": db if db is not None else 0.0,
+            "peaks": peaks,
+            "r": _to_float(cell(parts, "r")),
+            "vdc": _to_float(cell(parts, "vdc")),
+            "idc": _to_float(cell(parts, "idc")),
+            "p": _to_float(cell(parts, "p")),
+            "di": _to_float(cell(parts, "di")),
+            "dp": _to_float(cell(parts, "dp")),
+            "iac": _to_float(cell(parts, "iac")),
+            "ripple": _to_float(cell(parts, "ripple")),
+            "fs": _to_float(cell(parts, "fs")),
+            "off": _to_float(cell(parts, "off")),
+            "fine": False,
+            "imported": True,
+            "n_merge": int(n_merge) if n_merge and n_merge >= 1 else 1,
+        })
+
+    info = {
+        "encoding": used_enc,
+        "matched": sorted(col_of),
+        "unmatched": unmatched,
+        "skipped": skipped,
+        "derived_target": derived_target,
+    }
+    return rows, info
 
 
 class ChladniAnalyzerApp:
@@ -572,6 +751,7 @@ class ChladniAnalyzerApp:
         self._sort_by_freq = tk.BooleanVar(value=False)
         self._btn_sort = self._button(btns, "依頻率排序", self._toggle_sort)
         self._btn_sort.pack(side="left", padx=(0, 5))
+        self._button(btns, "匯入", self._import_csv).pack(side="left", padx=(0, 5))
         self._button(btns, "匯出", self._export_csv).pack(side="left", padx=(0, 5))
         self._button(btns, "清除", self._clear_history).pack(side="left")
 
@@ -591,8 +771,9 @@ class ChladniAnalyzerApp:
         self._hist_tree.configure(yscrollcommand=sb.set)
         self._hist_tree.grid(row=0, column=0, sticky="nsew")
         sb.grid(row=0, column=1, sticky="ns")
-        # 細掃來的列與合併列用不同顏色標示
+        # 細掃／匯入／合併的列用不同顏色標示
         self._hist_tree.tag_configure("fine", background="#1f2a3d")
+        self._hist_tree.tag_configure("imported", background="#26203a")
         self._hist_tree.tag_configure("merged", foreground=THEME["electric"])
 
     def _build_sweep_card(self, parent) -> None:
@@ -1018,6 +1199,7 @@ class ChladniAnalyzerApp:
             "time": rows[-1]["time"], "target_freq": key,
             "peaks": rows[-1]["peaks"], "n_merge": len(rows),
             "fine": any(r.get("fine") for r in rows),
+            "imported": all(r.get("imported") for r in rows),
         }
         for k in AVG_KEYS:
             vals = [r[k] for r in rows if r.get(k) is not None]
@@ -1063,7 +1245,9 @@ class ChladniAnalyzerApp:
             self._hist_tree.delete(item)
         for row in self._display_rows():
             tags = []
-            if row.get("fine"):
+            if row.get("imported"):
+                tags.append("imported")
+            elif row.get("fine"):
                 tags.append("fine")
             if row.get("n_merge", 1) > 1:
                 tags.append("merged")
@@ -1343,6 +1527,95 @@ class ChladniAnalyzerApp:
                     _fmt(row.get("fs"), 0), _fmt(row.get("off"), 3),
                     row.get("n_merge", 1), *peaks,
                 ])
+
+    def _import_csv(self) -> None:
+        """
+        匯入一個或多個本程式匯出的 CSV。
+
+        可一次選多個檔（例如粗掃一個檔、數次細掃各一個檔），全部併進同一份記錄，
+        再按「依頻率排序」就會依頻率排好並把重複頻率取平均。
+        """
+        from tkinter.filedialog import askopenfilenames
+        paths = askopenfilenames(
+            title="匯入 CSV（可多選）",
+            filetypes=[("CSV 檔案", "*.csv"), ("所有檔案", "*.*")])
+        if not paths:
+            return
+
+        # 已有資料時先問要合併還是取代
+        mode_replace = False
+        if self._record_history:
+            ans = messagebox.askyesnocancel(
+                "匯入方式",
+                f"目前已有 {len(self._record_history)} 筆記錄。\n\n"
+                "「是」＝併入現有記錄（可與既有掃頻合併取平均）\n"
+                "「否」＝清空後只保留匯入的資料\n"
+                "「取消」＝不匯入")
+            if ans is None:
+                return
+            mode_replace = not ans
+
+        all_rows: list[dict] = []
+        notes: list[str] = []
+        failed: list[str] = []
+        derived_any = False
+        legacy_any = False
+
+        for p in paths:
+            name = os.path.basename(p)
+            try:
+                rows, info = read_csv_file(p)
+            except Exception as exc:
+                failed.append(f"  ✗ {name}：{exc}")
+                logger.error("匯入 %s 失敗：%s", p, exc)
+                continue
+            all_rows.extend(rows)
+            note = f"  ✓ {name}：{len(rows)} 筆（{info['encoding']}）"
+            if info["skipped"]:
+                note += f"，略過 {info['skipped']} 列"
+            notes.append(note)
+            derived_any |= info["derived_target"]
+            if info["unmatched"]:
+                logger.info("%s 有未對應的欄位：%s", name, info["unmatched"])
+            # 舊版（交流阻抗時期）的欄位名稱，匯入後要提醒物理意義不同
+            with open(p, "r", newline="", encoding=info["encoding"]) as f:
+                first = f.readline()
+            if "|Z|" in first or "Irms" in first:
+                legacy_any = True
+
+        if not all_rows:
+            messagebox.showerror("匯入失敗", "沒有讀到任何資料。\n\n" + "\n".join(failed))
+            return
+
+        if mode_replace:
+            self._record_history.clear()
+        self._record_history.extend(all_rows)
+        self._refresh_tree()
+        self._redraw_sweep_curve()
+
+        # 摘要
+        freqs = [r["target_freq"] for r in all_rows if r.get("target_freq") is not None]
+        n_r = sum(1 for r in all_rows if r.get("r") is not None)
+        msg = [f"已匯入 {len(all_rows)} 筆，目前共 {len(self._record_history)} 筆。", ""]
+        msg += notes
+        if failed:
+            msg += [""] + failed
+        msg.append("")
+        if freqs:
+            msg.append(f"頻率範圍：{min(freqs):g} – {max(freqs):g} Hz")
+        msg.append(f"含電阻資料：{n_r} 筆")
+        if derived_any:
+            msg.append("※ 檔案沒有「目標頻率」欄，已用主峰頻率代替")
+        if legacy_any:
+            msg.append("※ 偵測到舊版交流欄位（|Z| / Irms），已填入電阻與電流欄位，\n"
+                       "   但那是交流量，物理意義與直流 R / Idc 不同，比較時請留意")
+        msg.append("")
+        msg.append("按「依頻率排序」可把重複頻率合併取平均。")
+
+        messagebox.showinfo("匯入完成", "\n".join(msg))
+        self._status_var.set(
+            f"已匯入 {len(all_rows)} 筆（共 {len(self._record_history)} 筆）"
+            + (f"　{min(freqs):g}–{max(freqs):g} Hz" if freqs else ""))
 
     def _export_csv(self) -> None:
         if not self._record_history:
